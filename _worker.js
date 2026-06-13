@@ -3341,7 +3341,7 @@ function getDashboardUI(hasDB) {
                                       <input type="number" id="add-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
                                   </div>
                                   <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1">User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)</label>
+                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ipproxy">User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)</label>
                                       <input type="text" id="add-user-proxy-ip" placeholder="e.g. 104.20.0.1, proxyip.com" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                                   </div>
                                   <div>
@@ -3569,6 +3569,7 @@ function getDashboardUI(hasDB) {
                   lbl_u_ports:"Custom Ports (Optional - overrides global ports, comma separated e.g. 443,80",
                   lbl_u_max_config:"Max Configs",
                   login_password:"Password",
+                  lbl_u_ipproxy:"User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)",
                   v_pop_title: "Release Notice", v_pop_whatsnew: "What's New", v_pop_headline: "New Features & Improvements",
                   v_pop_b1_title: "Add Custom Protocol-Port And Max Config For Users",
                   v_pop_b2_title: "",
@@ -3613,6 +3614,7 @@ function getDashboardUI(hasDB) {
                   lbl_u_ports:"نوع پورت",
                   lbl_u_max_config:"حداکثر تعداد کانفیگ",
                   login_password:"رمز ورود",
+                  lbl_u_ipproxy:"آی‌پی(های) پروکسی کاربر (اختیاری - آی‌پی پاک سراسری را نادیده می‌گیرد، با کاما/خط جدید از هم جدا می‌شوند)",
                   v_pop_title: "اطلاعیه تعمیرات", v_pop_whatsnew: "ویژگی‌های جدید", v_pop_headline: "امکانات جدید و بهبودها",
                   v_pop_b1_title: "اضافه شدن تنظیمات جدا برای هرکاربر(تعداد گانفیگ،پروتکل وپورت)",
                   v_pop_b2_title: "",

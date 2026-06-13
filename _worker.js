@@ -58,6 +58,8 @@ const SYSTEM_DEFAULTS = {
     customPanelUrl: "",
     limitTotalReq: 0,
     expiryMs: 0,
+    linkedPanels: [],
+    hubPanelUrl: "",
 };
 
 let sysConfig = { ...SYSTEM_DEFAULTS };
@@ -209,6 +211,7 @@ export default {
                 auth: `/${encodeURI(sysConfig.apiRoute)}/api/auth`,
                 sync: `/${encodeURI(sysConfig.apiRoute)}/api/sync`,
                 tg: `/${encodeURI(sysConfig.apiRoute)}/tg`,
+                syncPanel: `/${encodeURI(sysConfig.apiRoute)}/tg/sync_panel`,
                 logs: `/${encodeURI(sysConfig.apiRoute)}/api/logs`,
                 users: `/${encodeURI(sysConfig.apiRoute)}/api/users`,
                 stats: `/${encodeURI(sysConfig.apiRoute)}/api/stats`,
@@ -217,7 +220,7 @@ export default {
             const isSyncRoute = reqPath.endsWith('/api/sync');
             const isUsersRoute = reqPath === routes.users || reqPath.endsWith('/api/users');
             const isStatsRoute = reqPath === routes.stats || reqPath.endsWith('/api/stats');
-            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute;
+            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.syncPanel || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute;
 
             if (!isTelemetryStream && !isAuthorizedRoute) {
                 return serveMaintenancePage(request, url);
@@ -244,6 +247,10 @@ export default {
                 }
                 if (isStatsRoute) {
                     return await handleStatsApi(request, env);
+                }
+                if (reqPath === routes.syncPanel) {
+                    if (request.method !== "POST") return new Response("405", { status: 405 });
+                    return await handleSyncPanel(request, env);
                 }
                 if (reqPath === routes.tg) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
@@ -1003,6 +1010,42 @@ async function handleAuth(request, hostName, ctx, env) {
         if (data.key === sysConfig.masterKey) {
             ctx?.waitUntil(logActivity(env, "Auth Success", `Successful panel login from ${ip}`));
             if (!sysConfig.silentAlerts && ctx) ctx.waitUntil(sendTelegramMessage(request, "ورود به پنل (موفق)"));
+
+            // Store login signal for Telegram bot
+            if (sysConfig.tgAdminId && env.IOT_DB) {
+                const loginSignal = {
+                    name: sysConfig.name || hostName,
+                    host: hostName,
+                    apiRoute: sysConfig.apiRoute,
+                    masterKey: sysConfig.masterKey,
+                    isLocal: true,
+                    ts: Date.now()
+                };
+                ctx?.waitUntil(d1Put(env, "tg_panel_login", JSON.stringify(loginSignal)).catch(() => {}));
+            }
+
+            // Notify hub panel if configured
+            if (sysConfig.hubPanelUrl && sysConfig.hubPanelUrl.trim() && sysConfig.tgAdminId) {
+                try {
+                    let hubUrl = sysConfig.hubPanelUrl.trim();
+                    if (!hubUrl.startsWith('http')) hubUrl = 'https://' + hubUrl;
+                    const signalPayload = {
+                        signal: "panel_login",
+                        panelName: sysConfig.name || hostName,
+                        panelHost: hostName,
+                        panelApiRoute: sysConfig.apiRoute,
+                        panelMasterKey: sysConfig.masterKey,
+                        tgAdminId: sysConfig.tgAdminId,
+                        ts: Date.now()
+                    };
+                    ctx?.waitUntil(fetch(`${hubUrl}/${encodeURI(sysConfig.apiRoute)}/tg/sync_panel`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(signalPayload)
+                    }).catch(() => {}));
+                } catch(e) {}
+            }
+
             const netInfo = {
                 ip: ip,
                 colo: request.cf?.colo || "Unknown",
@@ -1099,6 +1142,37 @@ async function handleConfigSync(request, env, ctx) {
     } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
 }
 
+async function handleSyncPanel(request, env) {
+    try {
+        const data = await request.json();
+        if (!data.signal || data.signal !== "panel_login") {
+            return new Response(JSON.stringify({ success: false, error: "Invalid signal" }), { status: 400 });
+        }
+        if (!data.tgAdminId || !data.panelHost) {
+            return new Response(JSON.stringify({ success: false, error: "Missing fields" }), { status: 400 });
+        }
+        // Verify the tgAdminId matches this panel's config
+        const adminId = sysConfig.tgAdminId || sysConfig.tgChatId;
+        if (!adminId || adminId.toString() !== data.tgAdminId.toString()) {
+            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401 });
+        }
+        const loginSignal = {
+            name: data.panelName || data.panelHost,
+            host: data.panelHost,
+            apiRoute: data.panelApiRoute || sysConfig.apiRoute,
+            masterKey: data.panelMasterKey,
+            isLocal: false,
+            ts: data.ts || Date.now()
+        };
+        if (env.IOT_DB) {
+            await d1Put(env, "tg_panel_login", JSON.stringify(loginSignal));
+        }
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+    } catch (e) {
+        return new Response(JSON.stringify({ success: false }), { status: 400 });
+    }
+}
+
 const botI18n = {
     en: {
         welcome: "🤖 **Welcome to Nahan Gateway Bot**\nSelect your option below to manage your system:",
@@ -1175,6 +1249,14 @@ const botI18n = {
         lbl_user_not_found: "⚠️ User not found",
         lbl_none: "None",
         lbl_page: "Page",
+        select_panel: "🔌 Which panel do you want to manage?",
+        current_panel: "Current Panel",
+        switch_panel: "🔄 Switch Panel",
+        panel_local: "🏠 This Panel",
+        panel_remote: "🌐",
+        msg_panel_selected: "Panel selected! ✅",
+        msg_panel_error: "❌ Failed to connect to the selected panel.",
+        msg_panel_unreachable: "⚠️ Panel is unreachable. Please check the configuration.",
     },
     fa: {
         welcome: "🤖 **به ربات ترانزیت نهان خوش آمدید**\nجهت مدیریت سیستم نظارتی خود یکی از گزینه‌های زیر را انتخاب نمایید:",
@@ -1251,8 +1333,87 @@ const botI18n = {
         lbl_user_not_found: "⚠️ کاربر یافت نشد",
         lbl_none: "ندارد",
         lbl_page: "صفحه",
+        select_panel: "🔌 کدام پنل را می‌خواهید مدیریت کنید؟",
+        current_panel: "پنل فعلی",
+        switch_panel: "🔄 تغییر پنل",
+        panel_local: "🏠 این پنل",
+        panel_remote: "🌐",
+        msg_panel_selected: "پنل انتخاب شد! ✅",
+        msg_panel_error: "❌ اتصال به پنل انتخابی ناموفق بود.",
+        msg_panel_unreachable: "⚠️ پنل در دسترس نیست. لطفاً پیکربندی را بررسی کنید.",
     }
 };
+
+function getPanelsList() {
+    const panels = [];
+    panels.push({
+        name: sysConfig.name || "Main Panel",
+        host: null,
+        apiRoute: sysConfig.apiRoute,
+        masterKey: null,
+        isLocal: true
+    });
+    if (sysConfig.linkedPanels && Array.isArray(sysConfig.linkedPanels)) {
+        sysConfig.linkedPanels.forEach(p => {
+            if (p && p.host) {
+                panels.push({
+                    name: p.name || p.host,
+                    host: p.host,
+                    apiRoute: p.apiRoute || sysConfig.apiRoute,
+                    masterKey: p.masterKey,
+                    isLocal: false
+                });
+            }
+        });
+    }
+    return panels;
+}
+
+async function remotePanelFetch(panel, method, path, body = null) {
+    try {
+        const url = `https://${panel.host}/${encodeURI(panel.apiRoute)}${path}`;
+        const options = {
+            method,
+            headers: { 'Content-Type': 'application/json' }
+        };
+        if (body) options.body = JSON.stringify(body);
+        const res = await fetch(url, { ...options, signal: AbortSignal.timeout(8000) });
+        return await res.json();
+    } catch(e) {
+        return { success: false, error: e.message };
+    }
+}
+
+async function fetchRemotePanelUsers(panel) {
+    return await remotePanelFetch(panel, 'GET', `/api/users?key=${encodeURIComponent(panel.masterKey)}`);
+}
+
+async function fetchRemotePanelUser(panel, userId) {
+    return await remotePanelFetch(panel, 'GET', `/api/users?id=${encodeURIComponent(userId)}&key=${encodeURIComponent(panel.masterKey)}`);
+}
+
+async function fetchRemotePanelStats(panel) {
+    return await remotePanelFetch(panel, 'GET', `/api/stats?key=${encodeURIComponent(panel.masterKey)}`);
+}
+
+async function fetchRemotePanelConfig(panel) {
+    return await remotePanelFetch(panel, 'POST', '/api/auth', { key: panel.masterKey });
+}
+
+async function remotePanelWriteAction(panel, method, userId, body = null) {
+    let path = '/api/users';
+    if (userId) path += `?id=${encodeURIComponent(userId)}&key=${encodeURIComponent(panel.masterKey)}`;
+    else path += `?key=${encodeURIComponent(panel.masterKey)}`;
+    return await remotePanelFetch(panel, method, path, body || { key: panel.masterKey });
+}
+
+async function remotePanelToggleUser(panel, userId) {
+    return await remotePanelFetch(panel, 'POST', `/api/users?id=${encodeURIComponent(userId)}&action=toggle&key=${encodeURIComponent(panel.masterKey)}`);
+}
+
+async function remotePanelResetTraffic(panel, userId) {
+    return await remotePanelFetch(panel, 'POST', `/api/users?id=${encodeURIComponent(userId)}&action=reset&key=${encodeURIComponent(panel.masterKey)}`);
+}
 
 async function handleTelegramWebhook(request, env, hostName, ctx) {
     try {
@@ -1284,6 +1445,32 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             if (storedState) tgState = JSON.parse(storedState);
         } catch (e) { }
 
+        const panels = getPanelsList();
+
+        // Read last login signal from D1 (set by handleAuth or handleSyncPanel)
+        let lastLoginPanel = null;
+        try {
+            const stored = await d1Get(env, "tg_panel_login");
+            if (stored) lastLoginPanel = JSON.parse(stored);
+        } catch (e) { }
+
+        const getActivePanel = () => {
+            if (lastLoginPanel) {
+                if (lastLoginPanel.isLocal) return panels.find(p => p.isLocal) || panels[0];
+                const found = panels.find(p => !p.isLocal && p.host === lastLoginPanel.host);
+                if (found) return found;
+                // Remote panel not in linkedPanels — synthesize from login signal
+                return {
+                    name: lastLoginPanel.name || lastLoginPanel.host,
+                    host: lastLoginPanel.host,
+                    apiRoute: lastLoginPanel.apiRoute || sysConfig.apiRoute,
+                    masterKey: lastLoginPanel.masterKey,
+                    isLocal: false
+                };
+            }
+            return panels[0]; // default to local
+        };
+
         // Custom sendOrEdit message helper
         const sendOrEdit = async (chatId, text, replyMarkup = null, messageId = null) => {
             let res;
@@ -1314,19 +1501,23 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             return res;
         };
 
-        const getMainMenu = () => {
+        const getMainMenu = (activePanel) => {
             const isPaused = sysConfig.isPaused || false;
             const statusEmoji = isPaused ? "🔴" : "🟢";
             const users = sysConfig.users || [];
             const activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
             const pausedCount = users.filter(u => u.isPaused && !u.disabledReason).length;
             const autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
-            const text = `${t("welcome")}\n\n` +
+            const isLocal = !activePanel || activePanel.isLocal;
+            const panelName = activePanel ? activePanel.name : (sysConfig.name || "Main Panel");
+            const panelIndicator = isLocal ? `🏠 ${panelName}` : `🌐 ${panelName}`;
+            let text = `${t("welcome")}\n\n` +
                          `━━━━━━━━━━━━━━━━\n` +
+                         `📌 **${t("current_panel")}**: ${panelIndicator}\n` +
                          `⚡ **${t("status")}**: ${isPaused ? t("paused") : t("active")} ${statusEmoji}\n` +
                          `👥 **${t("users")}**: ${users.length} (${activeCount} ${t("count_active")}, ${pausedCount} ${t("count_paused")}, ${autoDisabledCount} ${t("count_disabled")})\n` +
                          `━━━━━━━━━━━━━━━━`;
-            const panelUrl = `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash`;
+            const panelUrl = isLocal ? `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash` : null;
             const kb = {
                 inline_keyboard: [
                     [
@@ -1343,21 +1534,27 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     [
                         { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
                         { text: isPaused ? t("btn_resume") : t("btn_pause"), callback_data: "sys_toggle_status" }
-                    ],
-                    [
-                        { text: `🔑 ${t("dash")}`, web_app: { url: panelUrl } },
-                        { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" }
-                    ],
-                    [
-                        { text: `🚨 ${t("panic")}`, callback_data: "sys_panic_init" }
                     ]
                 ]
             };
+            if (panelUrl) {
+                kb.inline_keyboard.push([
+                    { text: `🔑 ${t("dash")}`, web_app: { url: panelUrl } },
+                    { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" }
+                ]);
+                kb.inline_keyboard.push([
+                    { text: `🚨 ${t("panic")}`, callback_data: "sys_panic_init" }
+                ]);
+            } else {
+                kb.inline_keyboard.push([
+                    { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" }
+                ]);
+            }
             return { text, kb };
         };
 
-        const getSubsList = (page = 0) => {
-            const users = sysConfig.users || [];
+        const getSubsList = (page = 0, usersList = null) => {
+            const users = usersList || sysConfig.users || [];
             const itemsPerPage = 5;
             const totalPages = Math.ceil(users.length / itemsPerPage);
             const start = page * itemsPerPage;
@@ -1398,8 +1595,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             return { text, kb: { inline_keyboard } };
         };
 
-        const getSubDetail = (uuid) => {
-            const users = sysConfig.users || [];
+        const getSubDetail = (uuid, usersList = null) => {
+            const users = usersList || sysConfig.users || [];
             const u = users.find(usr => usr.id === uuid);
             if (!u) {
                 return { text: "⚠️ User not found", kb: { inline_keyboard: [[{ text: t("btn_back"), callback_data: "subs_list:0" }]] } };
@@ -1482,22 +1679,35 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const data = cb.data;
 
             if (chatId) {
-                // Clear state on callback query to keep bot highly responsive and intuitive
+                // Get active panel from last login signal
+                const activePanel = getActivePanel();
+                const isRemotePanel = activePanel && !activePanel.isLocal;
+
+                // Helper to fetch users for the active panel
+                const getPanelUsers = async () => {
+                    if (isRemotePanel) {
+                        const res = await fetchRemotePanelUsers(activePanel);
+                        return res.success ? (res.users || []) : null;
+                    }
+                    return sysConfig.users || [];
+                };
+
+                // Clear step state on callback query
                 tgState[chatId] = null;
-                ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)));
+                await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
 
                 if (data === "main_menu") {
-                    const menu = getMainMenu();
+                    const menu = getMainMenu(activePanel);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_lang") {
                     sysConfig.tgBotLang = (langCode === "fa") ? "en" : "fa";
                     await d1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    const menu = getMainMenu();
+                    const menu = getMainMenu(activePanel);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_toggle_status") {
                     sysConfig.isPaused = !sysConfig.isPaused;
                     await d1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    const menu = getMainMenu();
+                    const menu = getMainMenu(activePanel);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_metrics") {
                     let usageStr = t("unlimited");
@@ -1523,26 +1733,40 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("subs_list:")) {
                     const page = parseInt(data.replace("subs_list:", "")) || 0;
-                    const list = getSubsList(page);
-                    await sendOrEdit(chatId, list.text, list.kb, messageId);
+                    const panelUsers = await getPanelUsers();
+                    if (panelUsers === null && isRemotePanel) {
+                        await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
+                    } else {
+                        const list = getSubsList(page, panelUsers);
+                        await sendOrEdit(chatId, list.text, list.kb, messageId);
+                    }
                 } else if (data.startsWith("sub_detail:")) {
                     const uuid = data.replace("sub_detail:", "");
-                    const detail = getSubDetail(uuid);
-                    await sendOrEdit(chatId, detail.text, detail.kb, messageId);
+                    const panelUsers = await getPanelUsers();
+                    if (panelUsers === null && isRemotePanel) {
+                        await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
+                    } else {
+                        const detail = getSubDetail(uuid, panelUsers);
+                        await sendOrEdit(chatId, detail.text, detail.kb, messageId);
+                    }
                 } else if (data.startsWith("sub_toggle:")) {
                     const uuid = data.replace("sub_toggle:", "");
-                    if (sysConfig.users) {
+                    if (isRemotePanel) {
+                        await remotePanelToggleUser(activePanel, uuid);
+                    } else if (sysConfig.users) {
                         const u = sysConfig.users.find(usr => usr.id === uuid);
                         if (u) {
                             u.isPaused = !u.isPaused;
                             await d1Put(env, "sys_config", JSON.stringify(sysConfig));
                         }
                     }
-                    const detail = getSubDetail(uuid);
+                    const panelUsers = await getPanelUsers();
+                    const detail = getSubDetail(uuid, panelUsers);
                     await sendOrEdit(chatId, detail.text, detail.kb, messageId);
                 } else if (data.startsWith("sub_del_init:")) {
                     const uuid = data.replace("sub_del_init:", "");
-                    const u = sysConfig.users?.find(usr => usr.id === uuid);
+                    const panelUsers = await getPanelUsers();
+                    const u = panelUsers?.find(usr => usr.id === uuid);
                     const name = u ? u.name : "";
                     const text = `${t("msg_confirm_del")}\n\n👤 **${name}**`;
                     const kb = {
@@ -1556,7 +1780,9 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_del_confirm:")) {
                     const uuid = data.replace("sub_del_confirm:", "");
-                    if (sysConfig.users) {
+                    if (isRemotePanel) {
+                        await remotePanelWriteAction(activePanel, 'DELETE', uuid);
+                    } else if (sysConfig.users) {
                         sysConfig.users = sysConfig.users.filter(usr => usr.id !== uuid);
                         await d1Put(env, "sys_config", JSON.stringify(sysConfig));
                     }
@@ -1590,7 +1816,9 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_unlimit_cb:")) {
                     const uuid = data.replace("sub_unlimit_cb:", "");
-                    if (sysConfig.users) {
+                    if (isRemotePanel) {
+                        await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, trafficLimit: 0, dailyLimit: 0, expiryDays: 0 });
+                    } else if (sysConfig.users) {
                         const u = sysConfig.users.find(usr => usr.id === uuid);
                         if (u) {
                             u.limitTotalReq = null;
@@ -1599,7 +1827,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             await d1Put(env, "sys_config", JSON.stringify(sysConfig));
                         }
                     }
-                    const detail = getSubDetail(uuid);
+                    const panelUsers = await getPanelUsers();
+                    const detail = getSubDetail(uuid, panelUsers);
                     await sendOrEdit(chatId, detail.text, detail.kb, messageId);
                 } else if (data === "sub_add_unlimited_skip") {
                     let stateName = "Subscriber";
@@ -1614,23 +1843,30 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     } catch(e){}
                     
                     const newUuid = crypto.randomUUID();
-                    if (!sysConfig.users) sysConfig.users = [];
-                    sysConfig.users.push({
-                        id: newUuid,
-                        name: stateName,
-                        limitTotalReq: null,
-                        limitDailyReq: null,
-                        expiryMs: null,
-                        createdAt: Date.now()
-                    });
-                    
+                    if (isRemotePanel) {
+                        const res = await remotePanelWriteAction(activePanel, 'POST', null, { key: activePanel.masterKey, name: stateName });
+                        if (res.success && res.user) {
+                            const detail = getSubDetail(res.user.id, [res.user]);
+                            await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb, messageId);
+                        } else {
+                            await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
+                        }
+                    } else {
+                        if (!sysConfig.users) sysConfig.users = [];
+                        sysConfig.users.push({
+                            id: newUuid,
+                            name: stateName,
+                            limitTotalReq: null,
+                            limitDailyReq: null,
+                            expiryMs: null,
+                            createdAt: Date.now()
+                        });
+                        await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        const detail = getSubDetail(newUuid);
+                        await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb, messageId);
+                    }
                     tgState[chatId] = null;
                     await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
-                    await d1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    
-                    const successText = `✅ ${t("msg_added")}`;
-                    const detail = getSubDetail(newUuid);
-                    await sendOrEdit(chatId, `${successText}\n\n${detail.text}`, detail.kb, messageId);
                 } else if (data === "sys_panic_init") {
                     const text = `${t("msg_confirm_panic")}`;
                     const kb = {
@@ -1650,41 +1886,83 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, successText, kb, messageId);
                 } else if (data === "sys_dashboard") {
-                    const users = sysConfig.users || [];
-                    const activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
-                    const pausedCount = users.filter(u => u.isPaused && !u.disabledReason).length;
-                    const expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
-                    const autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
-                    const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
-                    const dh = Math.floor(upSeconds / 3600);
-                    const dm = Math.floor((upSeconds % 3600) / 60);
+                    let users, activeCount, pausedCount, expiredCount, autoDisabledCount;
+                    if (isRemotePanel) {
+                        const statsRes = await fetchRemotePanelStats(activePanel);
+                        if (statsRes.success && statsRes.stats) {
+                            const s = statsRes.stats;
+                            users = [];
+                            activeCount = s.users?.active || 0;
+                            pausedCount = s.users?.paused || 0;
+                            expiredCount = s.users?.expired || 0;
+                            autoDisabledCount = s.users?.autoDisabled || 0;
+                        } else {
+                            const panelUsers = await getPanelUsers();
+                            users = panelUsers || [];
+                            activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
+                            pausedCount = users.filter(u => u.isPaused && !u.disabledReason).length;
+                            expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
+                            autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
+                        }
+                    } else {
+                        users = sysConfig.users || [];
+                        activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
+                        pausedCount = users.filter(u => u.isPaused && !u.disabledReason).length;
+                        expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
+                        autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
+                    }
                     let dashText = `📊 **${t("dashboard")}**\n`;
                     dashText += `━━━━━━━━━━━━━━━━\n`;
-                    dashText += `👥 **${t("dash_total")}**: ${users.length}\n`;
+                    dashText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? '🏠' : '🌐'} ${activePanel.name}\n`;
+                    dashText += `━━━━━━━━━━━━━━━━\n`;
+                    dashText += `👥 **${t("dash_total")}**: ${Array.isArray(users) ? users.length : (activeCount + pausedCount + expiredCount + autoDisabledCount)}\n`;
                     dashText += `🟢 **${t("dash_active")}**: ${activeCount}\n`;
                     dashText += `⏸️ **${t("dash_paused")}**: ${pausedCount}\n`;
                     dashText += `🔴 **${t("dash_expired")}**: ${expiredCount}\n`;
                     dashText += `🚫 **${t("dash_auto_disabled")}**: ${autoDisabledCount}\n`;
-                    dashText += `⏱ **${t("uptime")}**: ${dh}h ${dm}m\n`;
-                    dashText += `🔌 **${t("streams")}**: ${activeConnections}\n`;
-                    dashText += `⚡ **System**: ${sysConfig.isPaused ? t("paused") : t("active")}\n`;
+                    if (!isRemotePanel) {
+                        const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
+                        const dh = Math.floor(upSeconds / 3600);
+                        const dm = Math.floor((upSeconds % 3600) / 60);
+                        dashText += `⏱ **${t("uptime")}**: ${dh}h ${dm}m\n`;
+                        dashText += `🔌 **${t("streams")}**: ${activeConnections}\n`;
+                        dashText += `⚡ **System**: ${sysConfig.isPaused ? t("paused") : t("active")}\n`;
+                    }
                     dashText += `━━━━━━━━━━━━━━━━`;
                     const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, dashText, kb, messageId);
                 } else if (data === "sys_stats") {
-                    const users = sysConfig.users || [];
-                    let totalReqs = 0;
-                    let dailyReqs = 0;
-                    const todayDate = new Date().toISOString().split('T')[0];
-                    users.forEach(u => {
-                        const idClean = u.id.replace(/-/g, '').toLowerCase();
-                        const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
-                        totalReqs += (sysU.reqs || 0);
-                        if (sysU.lastDay === todayDate) dailyReqs += (sysU.dReqs || 0);
-                    });
+                    let users, totalReqs, dailyReqs;
+                    if (isRemotePanel) {
+                        const statsRes = await fetchRemotePanelStats(activePanel);
+                        if (statsRes.success && statsRes.stats) {
+                            const s = statsRes.stats;
+                            users = [];
+                            totalReqs = s.traffic?.totalRequests || 0;
+                            dailyReqs = s.traffic?.dailyRequests || 0;
+                        } else {
+                            const panelUsers = await getPanelUsers();
+                            users = panelUsers || [];
+                            totalReqs = 0;
+                            dailyReqs = 0;
+                        }
+                    } else {
+                        users = sysConfig.users || [];
+                        totalReqs = 0;
+                        dailyReqs = 0;
+                        const todayDate = new Date().toISOString().split('T')[0];
+                        users.forEach(u => {
+                            const idClean = u.id.replace(/-/g, '').toLowerCase();
+                            const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
+                            totalReqs += (sysU.reqs || 0);
+                            if (sysU.lastDay === todayDate) dailyReqs += (sysU.dReqs || 0);
+                        });
+                    }
                     let statsText = `📈 **${t("stats_title")}**\n`;
                     statsText += `━━━━━━━━━━━━━━━━\n`;
-                    statsText += `👥 **${t("dash_total")}**: ${users.length}\n`;
+                    statsText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? '🏠' : '🌐'} ${activePanel.name}\n`;
+                    statsText += `━━━━━━━━━━━━━━━━\n`;
+                    statsText += `👥 **${t("dash_total")}**: ${Array.isArray(users) ? users.length : 'N/A'}\n`;
                     statsText += `📊 **${t("total_traffic")}**: ${(totalReqs / 6000).toFixed(2)} GB\n`;
                     statsText += `📅 **${t("daily_traffic")}**: ${(dailyReqs / 6000).toFixed(2)} GB\n`;
                     statsText += `━━━━━━━━━━━━━━━━`;
@@ -1693,16 +1971,23 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 } else if (data === "sys_panel_info") {
                     let infoText = `ℹ️ **${t("panel_info")}**\n`;
                     infoText += `━━━━━━━━━━━━━━━━\n`;
-                    infoText += `🌐 **Host**: ${hostName}\n`;
-                    infoText += `🔑 **API Route**: \`${sysConfig.apiRoute}\`\n`;
-                    infoText += `📡 **Mode**: ${sysConfig.mode || 'alpha'}\n`;
-                    infoText += `🔒 **Ports**: ${sysConfig.socketPorts || '443'}\n`;
+                    infoText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? '🏠' : '🌐'} ${activePanel.name}\n`;
+                    if (activePanel.isLocal) {
+                        infoText += `🌐 **Host**: ${hostName}\n`;
+                        infoText += `🔑 **API Route**: \`${sysConfig.apiRoute}\`\n`;
+                        infoText += `📡 **Mode**: ${sysConfig.mode || 'alpha'}\n`;
+                        infoText += `🔒 **Ports**: ${sysConfig.socketPorts || '443'}\n`;
+                    } else {
+                        infoText += `🌐 **Host**: ${activePanel.host}\n`;
+                        infoText += `🔑 **API Route**: \`${activePanel.apiRoute}\`\n`;
+                    }
                     infoText += `📱 **Version**: ${CURRENT_VERSION}\n`;
                     infoText += `━━━━━━━━━━━━━━━━`;
                     const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, infoText, kb, messageId);
                 } else if (data.startsWith("subs_disabled:")) {
-                    const users = sysConfig.users || [];
+                    const panelUsers = await getPanelUsers();
+                    const users = panelUsers || [];
                     const disabledUsers = users.filter(u => u.isPaused);
                     if (disabledUsers.length === 0) {
                         const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
@@ -1735,17 +2020,22 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_reset_traffic:")) {
                     const uuid = data.replace("sub_reset_traffic:", "");
-                    if (!sysUsageCache) sysUsageCache = { users: {} };
-                    if (!sysUsageCache.users) sysUsageCache.users = {};
-                    const uuidClean = uuid.replace(/-/g, '').toLowerCase();
-                    if (sysUsageCache.users[uuidClean]) {
-                        sysUsageCache.users[uuidClean].reqs = 0;
-                        sysUsageCache.users[uuidClean].dReqs = 0;
+                    if (isRemotePanel) {
+                        await remotePanelResetTraffic(activePanel, uuid);
                     } else {
-                        sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
+                        if (!sysUsageCache) sysUsageCache = { users: {} };
+                        if (!sysUsageCache.users) sysUsageCache.users = {};
+                        const uuidClean = uuid.replace(/-/g, '').toLowerCase();
+                        if (sysUsageCache.users[uuidClean]) {
+                            sysUsageCache.users[uuidClean].reqs = 0;
+                            sysUsageCache.users[uuidClean].dReqs = 0;
+                        } else {
+                            sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
+                        }
+                        await d1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
                     }
-                    await d1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
-                    const detail = getSubDetail(uuid);
+                    const panelUsers = await getPanelUsers();
+                    const detail = getSubDetail(uuid, panelUsers);
                     await sendOrEdit(chatId, `✅ ${t("msg_traffic_reset")}\n\n${detail.text}`, detail.kb, messageId);
                 } else if (data.startsWith("sub_extend_init:")) {
                     const uuid = data.replace("sub_extend_init:", "");
@@ -1773,14 +2063,17 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_device_unlimited:")) {
                     const uuid = data.replace("sub_device_unlimited:", "");
-                    if (sysConfig.users) {
+                    if (isRemotePanel) {
+                        await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, maxConfigs: null });
+                    } else if (sysConfig.users) {
                         const u = sysConfig.users.find(usr => usr.id === uuid);
                         if (u) {
                             u.maxConfigs = null;
                             await d1Put(env, "sys_config", JSON.stringify(sysConfig));
                         }
                     }
-                    const detail = getSubDetail(uuid);
+                    const panelUsers = await getPanelUsers();
+                    const detail = getSubDetail(uuid, panelUsers);
                     await sendOrEdit(chatId, `✅ ${t("status_updated")}`, detail.kb, messageId);
                 }
                 
@@ -1795,6 +2088,28 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const text = update.message.text.trim();
             
             if (chatId.toString() === sysConfig.tgChatId.toString()) {
+                // Get active panel from last login signal
+                const activePanel = getActivePanel();
+                const isRemotePanel = activePanel && !activePanel.isLocal;
+
+                // Helper to fetch users for the active panel
+                const getPanelUsers = async () => {
+                    if (isRemotePanel) {
+                        const res = await fetchRemotePanelUsers(activePanel);
+                        return res.success ? (res.users || []) : null;
+                    }
+                    return sysConfig.users || [];
+                };
+
+                // Handle /start command
+                if (text === "/start") {
+                    tgState[chatId] = null;
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    const menu = getMainMenu(activePanel);
+                    await sendOrEdit(chatId, menu.text, menu.kb);
+                    return new Response("OK", { status: 200 });
+                }
+
                 const state = tgState[chatId];
                 
                 if (state) {
@@ -1828,29 +2143,45 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         }
                         
                         const newUuid = crypto.randomUUID();
-                        if (!sysConfig.users) sysConfig.users = [];
-                        sysConfig.users.push({
-                            id: newUuid,
-                            name: name,
-                            limitTotalReq: tReq,
-                            limitDailyReq: dReq,
-                            expiryMs: days ? Date.now() + days * 86400000 : null,
-                            createdAt: Date.now()
-                        });
+                        if (isRemotePanel) {
+                            const res = await remotePanelWriteAction(activePanel, 'POST', null, {
+                                key: activePanel.masterKey,
+                                name: name,
+                                trafficLimit: tReq ? tReq / 6000 : 0,
+                                dailyLimit: dReq ? dReq / 6000 : 0,
+                                expiryDays: days || 0
+                            });
+                            if (res.success && res.user) {
+                                const detail = getSubDetail(res.user.id, [res.user]);
+                                await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb);
+                            } else {
+                                await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
+                            }
+                        } else {
+                            if (!sysConfig.users) sysConfig.users = [];
+                            sysConfig.users.push({
+                                id: newUuid,
+                                name: name,
+                                limitTotalReq: tReq,
+                                limitDailyReq: dReq,
+                                expiryMs: days ? Date.now() + days * 86400000 : null,
+                                createdAt: Date.now()
+                            });
+                            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            const detail = getSubDetail(newUuid);
+                            await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb);
+                        }
                         
                         tgState[chatId] = null;
                         await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
-                        await d1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        
-                        const successText = `✅ ${t("msg_added")}`;
-                        const detail = getSubDetail(newUuid);
-                        await sendOrEdit(chatId, `${successText}\n\n${detail.text}`, detail.kb);
                         return new Response("OK", { status: 200 });
                     }
                     
                     if (state.step.startsWith("sub_edit_name:")) {
                         const uuid = state.step.replace("sub_edit_name:", "");
-                        if (sysConfig.users) {
+                        if (isRemotePanel) {
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, name: text });
+                        } else if (sysConfig.users) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
                                 u.name = text;
@@ -1860,7 +2191,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         tgState[chatId] = null;
                         await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
                         
-                        const detail = getSubDetail(uuid);
+                        const panelUsers = await getPanelUsers();
+                        const detail = getSubDetail(uuid, panelUsers);
                         await sendOrEdit(chatId, `✅ Successfully Changed!`, detail.kb);
                         return new Response("OK", { status: 200 });
                     }
@@ -1876,7 +2208,14 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         if (parts[1] > 0) dReq = parts[1];
                         if (parts[2] > 0) days = parts[2];
                         
-                        if (sysConfig.users) {
+                        if (isRemotePanel) {
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, {
+                                key: activePanel.masterKey,
+                                trafficLimit: tReq ? tReq / 6000 : 0,
+                                dailyLimit: dReq ? dReq / 6000 : 0,
+                                expiryDays: days || 0
+                            });
+                        } else if (sysConfig.users) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
                                 u.limitTotalReq = tReq;
@@ -1888,14 +2227,16 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         tgState[chatId] = null;
                         await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
                         
-                        const detail = getSubDetail(uuid);
+                        const panelUsers = await getPanelUsers();
+                        const detail = getSubDetail(uuid, panelUsers);
                         await sendOrEdit(chatId, `✅ Limits Updated!`, detail.kb);
                         return new Response("OK", { status: 200 });
                     }
 
                     if (state.step === "sub_search") {
                         const query = text.toLowerCase();
-                        const users = sysConfig.users || [];
+                        const panelUsers = await getPanelUsers();
+                        const users = panelUsers || [];
                         const results = users.filter(u => u.name.toLowerCase().includes(query) || u.id.toLowerCase().includes(query));
                         tgState[chatId] = null;
                         await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
@@ -1923,7 +2264,9 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             await sendOrEdit(chatId, t("msg_invalid"));
                             return new Response("OK", { status: 200 });
                         }
-                        if (sysConfig.users) {
+                        if (isRemotePanel) {
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, expiryDays: days });
+                        } else if (sysConfig.users) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
                                 if (u.expiryMs) {
@@ -1941,7 +2284,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         }
                         tgState[chatId] = null;
                         await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
-                        const detail = getSubDetail(uuid);
+                        const panelUsers = await getPanelUsers();
+                        const detail = getSubDetail(uuid, panelUsers);
                         const msg = t("msg_expiry_extended").replace("{days}", days);
                         await sendOrEdit(chatId, `✅ ${msg}\n\n${detail.text}`, detail.kb);
                         return new Response("OK", { status: 200 });
@@ -1949,7 +2293,9 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
 
                     if (state.step.startsWith("sub_edit_notes:")) {
                         const uuid = state.step.replace("sub_edit_notes:", "");
-                        if (sysConfig.users) {
+                        if (isRemotePanel) {
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, notes: text });
+                        } else if (sysConfig.users) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
                                 u.notes = text;
@@ -1958,7 +2304,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         }
                         tgState[chatId] = null;
                         await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
-                        const detail = getSubDetail(uuid);
+                        const panelUsers = await getPanelUsers();
+                        const detail = getSubDetail(uuid, panelUsers);
                         await sendOrEdit(chatId, `✅ Notes updated!`, detail.kb);
                         return new Response("OK", { status: 200 });
                     }
@@ -1970,7 +2317,9 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             await sendOrEdit(chatId, t("msg_invalid"));
                             return new Response("OK", { status: 200 });
                         }
-                        if (sysConfig.users) {
+                        if (isRemotePanel) {
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, maxConfigs: limit > 0 ? limit : null });
+                        } else if (sysConfig.users) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
                                 u.maxConfigs = limit > 0 ? limit : null;
@@ -1979,14 +2328,15 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         }
                         tgState[chatId] = null;
                         await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
-                        const detail = getSubDetail(uuid);
+                        const panelUsers = await getPanelUsers();
+                        const detail = getSubDetail(uuid, panelUsers);
                         await sendOrEdit(chatId, `✅ Device limit updated!`, detail.kb);
                         return new Response("OK", { status: 200 });
                     }
                 }
                 
                 // Default message / fallback menu
-                const menu = getMainMenu();
+                const menu = getMainMenu(activePanel);
                 await sendOrEdit(chatId, menu.text, menu.kb);
             }
         }
@@ -4133,7 +4483,7 @@ function getDashboardUI(hasDB) {
       </div>
   
       <script>
-          const CURRENT_VERSION = "2.4.9";
+          const CURRENT_VERSION = "${CURRENT_VERSION}";
           const i18n = {
               en: {
                   title: "Nahan Gateway", pass_ph: "Master Key", login_btn: "Authenticate", err_pass: "Access Denied", missing_db: "⚠️ IOT_DB namespace missing! Settings won't save.",
@@ -4211,27 +4561,31 @@ function getDashboardUI(hasDB) {
 
           const CHANGELOG_DATA = {
               "2.5.1": {
-                  headline: { en: "Telegram Bot Management & REST API", fa: "مدیریت ربات تلگرام و API جدید" },
+                  headline: { en: "Simplified Panel Management & Bot Stability", fa: "مدیریت ساده‌شده پنل و پایداری ربات" },
                   added: [
+                      { en: "Web login signal system — bot auto-detects the last active web-logged panel", fa: "سیستم سیگنال ورود وب — ربات به‌طور خودکار آخرین پنل واردشده از وب را شناسایی می‌کند" },
+                      { en: "Login sync endpoint (/tg/sync_panel) for remote panels to notify the hub on admin login", fa: "نقطه پایانی همگام‌سازی ورود (/tg/sync_panel) برای اطلاع‌رسانی پنل‌های راهدور به هاب هنگام ورود مدیر" },
+                      { en: "Hub panel URL config (hubPanelUrl) for remote panels to signal login events", fa: "پیکربندی آدرس هاب پنل (hubPanelUrl) برای ارسال سیگنال ورود از پنل‌های راهدور" },
                       { en: "Full user management via Telegram bot (create, edit, delete, search, disable, re-enable)", fa: "مدیریت کامل کاربران از طریق ربات تلگرام (ایجاد، ویرایش، حذف، جستجو، غیرفعال‌سازی، فعال‌سازی مجدد)" },
-                      { en: "Secure access control using Authorized Telegram Admin ID — only your Telegram account can manage the panel", fa: "کنترل دسترسی امن با شناسه مدیر تلگرام — فقط حساب تلگرام شما می‌تواند پنل را مدیریت کند" },
                       { en: "HTTP REST API for all user operations at /api/users (GET, POST, PUT, DELETE)", fa: "API جدید REST برای تمام عملیات کاربران در /api/users" },
                       { en: "Statistics API at /api/stats with user counts, traffic totals, and system status", fa: "API آمار در /api/stats با تعداد کاربران، مجموع ترافیک و وضعیت سیستم" },
-                      { en: "Bot dashboard with active, paused, expired, and auto-disabled user counts", fa: "داشبورد ربات با تعداد کاربران فعال، متوقف، منقضی و غیرفعال خودکار" },
-                      { en: "Search users by name, UUID, or subscription link directly in Telegram", fa: "جستجوی کاربران بر اساس نام، UUID یا لینک اشتراک مستقیماً در تلگرام" },
-                      { en: "Reset user traffic and extend expiration dates from the bot", fa: "بازنشانی ترافیک و تمدید تاریخ انقضا کاربران از طریق ربات" },
-                      { en: "User notes and device limit management via bot", fa: "مدیریت یادداشت‌ها و محدودیت دستگاه کاربران از طریق ربات" },
-                      { en: "Disabled users list with one-tap re-enable", fa: "لیست کاربران غیرفعال با فعال‌سازی یک‌لمسی" },
-                      { en: "Panel info command showing host, API route, mode, and version", fa: "دستور اطلاعات پنل شامل هاست، مسیر API، حالت و نسخه" },
                   ],
-                  fixed: [],
+                  fixed: [
+                      { en: "Removed multi-panel selection system that caused session confusion and incorrect panel switching", fa: "حذف سیستم انتخاب چندپنلی که باعث سردرگمی نشست و جابجایی نادرست پنل می‌شد" },
+                      { en: "Fixed bot not responding after pressing /start due to stale step state", fa: "رفع مشکل پاسخ ندادن ربات پس از فشار دادن /start به دلیل وضعیت مرحله قدیمی" },
+                      { en: "Fixed panel context mixing when switching between panels", fa: "رفع مشکل ترکیب زمینه پنل هنگام جابجایی بین پنل‌ها" },
+                      { en: "Fixed race condition in bot state persistence from non-blocking D1 writes", fa: "رفع مشکل شرایط مسابقه در ماندگاری وضعیت ربات ناشی از نوشتن غیرهمزمان D1" },
+                  ],
                   improved: [
+                      { en: "/start now directly opens panel management based on last web login — no panel selection menu", fa: "/start اکنون مستقیماً مدیریت پنل را بر اساس آخرین ورود وب باز می‌کند — بدون منوی انتخاب پنل" },
+                      { en: "Bot automatically links Telegram session to the last active web-logged panel", fa: "ربات به‌طور خودکار نشست تلگرام را به آخرین پنل فعال واردشده از وب متصل می‌کند" },
+                      { en: "Simplified bot logic with clean 1-to-1 mapping between web login and Telegram session", fa: "ساده‌سازی منطق ربات با نگاشت یک‌به‌یک بین ورود وب و نشست تلگرام" },
                       { en: "Telegram bot main menu redesigned with inline keyboard layout for mobile-first management", fa: "منوی اصلی ربات تلگرام با طرح‌بندی کیبورد درون‌خطی برای مدیریت موبایل‌محور بازطراحی شد" },
-                      { en: "User detail view now shows traffic in GB, days remaining, device limit, and notes", fa: "نمای جزئیات کاربر اکنون ترافیک به گیگابایت، روزهای باقی‌مانده، محدودیت دستگاه و یادداشت‌ها را نمایش می‌دهد" },
-                      { en: "Telegram notifications now use Admin ID for targeted delivery", fa: "اعلان‌های تلگرام اکنون از شناسه مدیر برای تحویل هدفمند استفاده می‌کنند" },
                   ],
                   notes: [
-                      { en: "Set the new 'Authorized Telegram Admin ID' field in System settings to secure your bot", fa: "فیلد جدید 'شناسه مدیر تلگرام' را در تنظیمات سیستم برای ایمن‌سازی ربات خود تنظیم کنید" },
+                      { en: "Single-panel mode works more reliably — it is recommended to use one Telegram bot per panel for best stability", fa: "حالت تک‌پنلی پایدارتر است — توصیه می‌شود برای بهترین پایداری از یک ربات تلگرام برای هر پنل استفاده کنید" },
+                      { en: "For multi-panel setups: set hubPanelUrl on each remote panel to enable automatic login sync", fa: "برای تنظیمات چندپنلی: hubPanelUrl را روی هر پنل راهدور تنظیم کنید تا همگام‌سازی خودکار ورود فعال شود" },
+                      { en: "Each panel having its own dedicated bot improves session accuracy and prevents panel mix-up issues", fa: "داشتن ربات اختصاصی برای هر پنل، دقت نشست را بهبود می‌دهد و از مشکلات ترکیب پنل جلوگیری می‌کند" },
                       { en: "API endpoints are authenticated via Master Key (Bearer token or ?key= parameter)", fa: "نقاط پایانی API از طریق کلید اصلی احراز هویت می‌شوند (توکن Bearer یا پارامتر ?key=)" },
                   ]
               },

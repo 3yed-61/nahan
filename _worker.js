@@ -695,25 +695,51 @@ function serveSubscriptionInfoPage(user, host, url, request) {
     return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
+let sysConfigLoading = null;
+let sysUsageLoading = null;
+let backupIpLoading = null;
+
 async function loadSysConfig(env) {
     const now = Date.now();
 
     if (env.IOT_DB) {
         if (now - sysConfigCacheTime > CACHE_TTL_CONFIG) {
-            sysConfigCacheTime = now;
-            try { const stored = await d1Get(env, "sys_config"); if (stored) sysConfig = { ...SYSTEM_DEFAULTS, ...JSON.parse(stored) }; } catch (e) { }
+            if (!sysConfigLoading) {
+                sysConfigLoading = d1Get(env, "sys_config").then(stored => {
+                    sysConfig = { ...SYSTEM_DEFAULTS, ...(stored ? JSON.parse(stored) : null) };
+                    sysConfigCacheTime = Date.now();
+                }).catch(() => {
+                    sysConfig = { ...SYSTEM_DEFAULTS };
+                    sysConfigCacheTime = Date.now();
+                }).finally(() => { sysConfigLoading = null; });
+            }
+            await sysConfigLoading;
         }
         if (now - sysUsageCacheTime > CACHE_TTL_USAGE) {
-            sysUsageCacheTime = now;
-            try { const ustored = await d1Get(env, "sys_usage"); if (ustored) sysUsageCache = JSON.parse(ustored); } catch (e) { }
+            if (!sysUsageLoading) {
+                sysUsageLoading = d1Get(env, "sys_usage").then(ustored => {
+                    if (ustored) sysUsageCache = JSON.parse(ustored);
+                    else sysUsageCache = { users: {} };
+                    sysUsageCacheTime = Date.now();
+                }).catch(() => {
+                    sysUsageCache = { users: {} };
+                    sysUsageCacheTime = Date.now();
+                }).finally(() => { sysUsageLoading = null; });
+            }
+            await sysUsageLoading;
         }
     }
 
     if (now - backupIpCacheTime > CACHE_TTL_BACKUP_IP) {
-        backupIpCacheTime = now;
-        if (env.IOT_DB) {
-            try { backupIpCache = await d1Get(env, "backup_ip"); } catch (e) { }
+        if (!backupIpLoading) {
+            backupIpLoading = (env.IOT_DB ? d1Get(env, "backup_ip") : Promise.resolve(null)).then(val => {
+                backupIpCache = val;
+                backupIpCacheTime = Date.now();
+            }).catch(() => {
+                backupIpCacheTime = Date.now();
+            }).finally(() => { backupIpLoading = null; });
         }
+        await backupIpLoading;
     }
     const defaultRelay = ["pro", "xy", "ip.cmliussss.net"].join("");
     sysConfig.customRelay = backupIpCache ?? env.RELAY_IP ?? defaultRelay;
